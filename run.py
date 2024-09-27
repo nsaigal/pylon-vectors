@@ -4,6 +4,8 @@ import chromadb
 from chromadb.utils import embedding_functions
 from sklearn.feature_extraction.text import TfidfVectorizer
 from sklearn.cluster import KMeans
+from sklearn.metrics import silhouette_score
+import numpy as np
 import logging
 import os
 
@@ -71,7 +73,7 @@ def create_issue_embeddings(issues, collection):
     except Exception as e:
         logging.error(f"Error creating issue embeddings: {e}")
 
-def semantic_search(query, collection, n_results=2):
+def semantic_search(query, collection, n_results=10):
     try:
         results = collection.query(
             query_texts=[query],
@@ -82,55 +84,88 @@ def semantic_search(query, collection, n_results=2):
         logging.error(f"Error performing semantic search: {e}")
         return None
 
-def generate_cluster_title(cluster_issues):
+def generate_cluster_title(cluster_metadata):
     try:
+        # Prepare a summary of the cluster for better title generation
+        issue_summaries = [f"Title: {meta['title']}, Product Area: {meta['product_areas']}" 
+                           for meta in cluster_metadata[:5]]  # Limit to first 5 for brevity
+        cluster_summary = "\n".join(issue_summaries)
+
         r = requests.post('http://localhost:11434/api/generate', json={
             'model': 'llama3.2:latest',
-            'prompt': f"Generate one title for the following cluster of issues. Return the title and nothing else. Issues: {cluster_issues}",
+            'prompt': f"Generate a concise and descriptive title for the following cluster of issues. The title should capture the main theme or problem addressed in these issues. Cluster summary:\n{cluster_summary}\n\nTitle:",
             'stream': False
         })
         r.raise_for_status()
-        return r.json()['response']
+        return r.json()['response'].strip()
     except requests.RequestException as e:
         logging.error(f"Error generating cluster title: {e}")
         return "Untitled Cluster"
 
-def cluster_issues(collection, no_of_clusters=10):
+def cluster_issues(collection, min_clusters=2, max_clusters=10):
     try:
-        # Get all documents from the collection
-        documents = collection.get()['documents']
+        # Get all documents and their metadata from the collection
+        result = collection.get()
+        documents = result['documents']
+        metadatas = result['metadatas']
+
+        # Ensure we have enough documents for clustering
+        n_samples = len(documents)
+        if n_samples < 2:
+            logging.warning("Not enough samples for clustering. Returning all documents in a single cluster.")
+            return {0: documents}, {0: metadatas}, ["All Issues"]
+
+        # Adjust max_clusters if necessary
+        max_clusters = min(max_clusters, n_samples - 1)
+        min_clusters = min(min_clusters, max_clusters)
 
         # Vectorize the documents
-        vectorizer = TfidfVectorizer()
+        vectorizer = TfidfVectorizer(stop_words='english')
         X = vectorizer.fit_transform(documents)
 
-        # Perform K-means clustering
-        kmeans = KMeans(n_clusters=no_of_clusters, random_state=42)
-        kmeans.fit(X)
+        # Find the optimal number of clusters using silhouette score
+        silhouette_scores = []
+        K = range(min_clusters, max_clusters + 1)
+        for k in K:
+            if k >= n_samples:
+                break
+            kmeans = KMeans(n_clusters=k, random_state=42, n_init=10)
+            cluster_labels = kmeans.fit_predict(X)
+            if len(set(cluster_labels)) < 2:
+                continue  # Skip if we ended up with only one cluster
+            score = silhouette_score(X, cluster_labels)
+            silhouette_scores.append(score)
 
-        # Get the cluster centers
-        cluster_centers = kmeans.cluster_centers_
+        if not silhouette_scores:
+            logging.warning("Could not compute valid clusters. Returning all documents in a single cluster.")
+            return {0: documents}, {0: metadatas}, ["All Issues"]
 
-        # Get the cluster labels
-        cluster_labels = kmeans.labels_
+        optimal_k = K[np.argmax(silhouette_scores)]
 
-        # Create a dictionary to store issues by cluster
-        clustered_issues = {i: [] for i in range(no_of_clusters)}
+        # Perform K-means clustering with the optimal number of clusters
+        kmeans = KMeans(n_clusters=optimal_k, random_state=42, n_init=10)
+        cluster_labels = kmeans.fit_predict(X)
 
-        # Assign issues to their respective clusters
+        # Create dictionaries to store issues and metadata by cluster
+        clustered_issues = {i: [] for i in range(optimal_k)}
+        clustered_metadata = {i: [] for i in range(optimal_k)}
+
+        # Assign issues and metadata to their respective clusters
         for i, label in enumerate(cluster_labels):
             clustered_issues[label].append(documents[i])
+            clustered_metadata[label].append(metadatas[i])
 
-        # Create titles for each cluster using Llama 3.2 8b
+        # Create titles for each cluster
         cluster_titles = []
         for cluster_id in clustered_issues:
             cluster_issues = clustered_issues[cluster_id]
-            cluster_titles.append(generate_cluster_title(cluster_issues))
+            cluster_meta = clustered_metadata[cluster_id]
+            cluster_titles.append(generate_cluster_title(cluster_meta))
 
-        return clustered_issues, cluster_titles
+        return clustered_issues, clustered_metadata, cluster_titles
     except Exception as e:
         logging.error(f"Error clustering issues: {e}")
-        return {}, []
+        return {0: documents}, {0: metadatas}, ["All Issues (Error in clustering)"]
 
 if __name__ == "__main__":
     try:
@@ -141,7 +176,7 @@ if __name__ == "__main__":
         # issues = filter_issues(issues)
         # create_issue_embeddings(issues, collection)
 
-        # query = "api pricing"
+        # query = "integration"
         # logging.info(f'QUERY: {query}')
         # results = semantic_search(query, collection)
         # if results:
@@ -149,11 +184,15 @@ if __name__ == "__main__":
         #         print(r)
         #         print()
 
-        clustered_issues, cluster_titles = cluster_issues(collection, no_of_clusters=10)
-        for cluster_title, issues in clustered_issues.items():
-            print(cluster_titles[cluster_title])
-            for issue in issues:
-                print(issue + '\n')
-            print('\n\n')
+        clustered_issues, clustered_metadata, cluster_titles = cluster_issues(collection, min_clusters=2, max_clusters=10)
+        for i, (issues, metadata, title) in enumerate(zip(clustered_issues.values(), clustered_metadata.values(), cluster_titles)):
+            print(f"Cluster {i+1}: {title}")
+            print('Number of issues:', len(issues))
+            for issue, meta in zip(issues[:3], metadata[:3]):  # Print first 3 issues of each cluster
+                print(f"Title: {meta['title']}")
+                print(f"Product Area: {meta['product_areas']}")
+                print(f"Issue snippet: {issue[:100]}...")  # Print first 100 characters of each issue
+                print()
+            print('\n')
     except Exception as e:
         logging.error(f"An unexpected error occurred: {e}")
