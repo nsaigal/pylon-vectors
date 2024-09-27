@@ -13,6 +13,7 @@ This project analyzes customer issues from Pylon, clusters them, and generates t
 
 ## Requirements
 
+- Pylon API Key
 - ChromaDB
 - Ollama
 
